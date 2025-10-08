@@ -1,11 +1,40 @@
 import { useState } from 'react';
-import { Send, Sparkles, Loader2 } from 'lucide-react';
+import { Send, Sparkles, Loader2, Copy, Check } from 'lucide-react';
+
+interface UsageMetadata {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cost: number;
+}
 
 function App() {
   const [message, setMessage] = useState('');
   const [response, setResponse] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [usageMetadata, setUsageMetadata] = useState<UsageMetadata | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  // Gemini 2.0 Flash pricing
+  // Input: $0.10 per 1M tokens, Output: $0.40 per 1M tokens
+  const calculateCost = (inputTokens: number, outputTokens: number): number => {
+    const inputCost = (inputTokens / 1_000_000) * 0.10;
+    const outputCost = (outputTokens / 1_000_000) * 0.40;
+    return inputCost + outputCost;
+  };
+
+  const handleCopyToClipboard = async () => {
+    if (!response) return;
+
+    try {
+      await navigator.clipboard.writeText(response);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -18,9 +47,11 @@ function App() {
     setLoading(true);
     setError('');
     setResponse('');
+    setUsageMetadata(null);
+    setCopied(false);
 
     try {
-      const res = await fetch('http://localhost:5000/api/chat', {
+      const res = await fetch('http://localhost:5000/api/chat/stream', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -28,18 +59,64 @@ function App() {
         body: JSON.stringify({ message }),
       });
 
-      const data = await res.json();
-
       if (!res.ok) {
-        throw new Error(data.error || 'Failed to get response');
+        throw new Error('Failed to get response');
       }
 
-      setResponse(data.response);
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (!reader) {
+        throw new Error('No reader available');
+      }
+
+      let accumulatedText = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            try {
+              const parsed = JSON.parse(data);
+
+              if (parsed.type === 'chunk') {
+                accumulatedText += parsed.text;
+                setResponse(accumulatedText);
+              } else if (parsed.type === 'metadata') {
+                const cost = calculateCost(parsed.inputTokens, parsed.outputTokens);
+                setUsageMetadata({
+                  inputTokens: parsed.inputTokens,
+                  outputTokens: parsed.outputTokens,
+                  totalTokens: parsed.totalTokens,
+                  cost: cost,
+                });
+              } else if (parsed.type === 'error') {
+                throw new Error(parsed.message);
+              }
+            } catch (e) {
+              // Ignore JSON parse errors for non-JSON lines
+            }
+          }
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
       setLoading(false);
     }
+  };
+
+  // Get current date dynamically
+  const getCurrentDate = () => {
+    const currentDate = new Date();
+    const options: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'long', day: 'numeric' };
+    return currentDate.toLocaleDateString('en-US', options);
   };
 
   return (
@@ -97,14 +174,58 @@ function App() {
             )}
 
             {response && (
-              <div className="mt-6 p-6 bg-gradient-to-br from-blue-50 to-slate-50 border border-blue-100 rounded-lg">
-                <h3 className="text-lg font-semibold text-gray-800 mb-3 flex items-center gap-2">
-                  <Sparkles className="w-5 h-5 text-blue-600" />
-                  AI Response
-                </h3>
-                <div className="prose prose-sm max-w-none">
-                  <p className="text-gray-700 whitespace-pre-wrap leading-relaxed">{response}</p>
+              <div className="mt-6 space-y-4">
+                <div className="p-6 bg-gradient-to-br from-blue-50 to-slate-50 border border-blue-100 rounded-lg">
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
+                      <Sparkles className="w-5 h-5 text-blue-600" />
+                      AI Response
+                    </h3>
+                    <button
+                      onClick={handleCopyToClipboard}
+                      className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors"
+                    >
+                      {copied ? (
+                        <>
+                          <Check className="w-4 h-4" />
+                          Copied!
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-4 h-4" />
+                          Copy
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  <div className="prose prose-sm max-w-none">
+                    <p className="text-gray-700 whitespace-pre-wrap leading-relaxed">{response}</p>
+                  </div>
                 </div>
+
+                {usageMetadata && (
+                  <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg">
+                    <h4 className="text-sm font-semibold text-gray-700 mb-3">Token Usage & Cost</h4>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div>
+                        <p className="text-xs text-gray-500 mb-1">Input Tokens</p>
+                        <p className="text-lg font-bold text-gray-800">{usageMetadata.inputTokens.toLocaleString()}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-500 mb-1">Output Tokens</p>
+                        <p className="text-lg font-bold text-gray-800">{usageMetadata.outputTokens.toLocaleString()}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-500 mb-1">Total Tokens</p>
+                        <p className="text-lg font-bold text-gray-800">{usageMetadata.totalTokens.toLocaleString()}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-500 mb-1">Total Cost</p>
+                        <p className="text-lg font-bold text-green-600">${usageMetadata.cost.toFixed(6)}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -113,6 +234,10 @@ function App() {
         <div className="mt-6 text-center text-sm text-gray-500">
           <p>Powered by Google Gemini API</p>
         </div>
+
+        <footer className="mt-8 text-center text-sm text-gray-600 border-t border-gray-200 pt-6">
+          <p>© 2025 khokhiashvili.mariam@kiu.edu.ge - {getCurrentDate()}</p>
+        </footer>
       </div>
     </div>
   );
